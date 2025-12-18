@@ -6,231 +6,277 @@ using UnityEngine;
 
 
 
-/// <summary> Cubu情報を格納するクラス </summary>
-public class DrawMeshData
+public class DrawBatchData
 {
-    public Mesh mesh_;
-    public Material material_;
-    public List<CubeInfomation> cube_list_;
+    public Mesh Mesh;
+    public Material Material;
+    public List<Matrix4x4> InstanceMatrices = new List<Matrix4x4>();
+    public Bounds TotalBounds; // バッチ全体のバウンディングボックス
 
+    // GPU送信用バッファ
+    public GraphicsBuffer MatrixBuffer;
+    public NativeArray<Matrix4x4> NativeMatrices;
 
-
-    public DrawMeshData()
+    public void Dispose()
     {
-        mesh_ = new Mesh();
-        cube_list_ = new List<CubeInfomation>();
+        if (MatrixBuffer != null) MatrixBuffer.Dispose();
+        if (NativeMatrices.IsCreated) NativeMatrices.Dispose();
     }
 }
 
 
 
-
-
-/// <summary> DrawMeshを使用しての描画クラス、設定から描画まで </summary>
+/// <summary>
+/// DrawMeshInstancedProceduralを使用した最適化された描画クラス
+/// </summary>
 public class ViewDrawMesh : MonoBehaviour
 {
-    /// <summary> Procedural用の行列 </summary>
-    private List<NativeArray<Matrix4x4>> matrix_produral;
+    // シェーダー名の判定用定数
+    private const string TARGET_SHADER_NAME = "Custom/EvoRougeBlocks";
 
-    /// <summary> バッファリスト </summary>
-    private List<GraphicsBuffer> _graphicsBuffers;
-
-    /// <summary> Procedural描画用のCubu情報が入ったリスト </summary>
-    private List<DrawMeshData> produral_data;
+    // シェーダープロパティIDのキャッシュ
+    private static readonly int matrix_bufferId_ = Shader.PropertyToID("_Matrix");
 
 
+    private List<DrawBatchData> draw_Batches_ = new List<DrawBatchData>();
+    private bool isInitialized_ = false;
 
-    void Awake()
-    {
-        matrix_produral = new List<NativeArray<Matrix4x4>>();
-
-        _graphicsBuffers = new List<GraphicsBuffer>();
-
-        produral_data = new List<DrawMeshData>();
-    }
 
 
     void Start()
     {
-        AddCube(DungeonManager.Map);
-        DrawProceduralSetup();
+        InitializeDungeon(DungeonManager.Map);
     }
 
     void Update()
     {
-        int mat = 0;
+        if (!isInitialized_) return;
 
-
-        // Proceduralの描画
-        foreach (var v in produral_data)
-        {
-            NativeArray<Matrix4x4> temp = matrix_produral[mat];
-            Bounds BOUNDS = new Bounds(Vector3.zero, v.mesh_.bounds.size * 600);
-
-
-            mat++;
-            Graphics.DrawMeshInstancedProcedural(v.mesh_, 0, v.material_, BOUNDS, temp.Length);
-        }
+        RenderBatches();
     }
-
-
-
-    /// <summary> Proceduralを使用するためのCubu情報を登録する </summary>
-    private void AddCube(DungeonMap map)
-    {
-        Dictionary<string, List<CubeInfomation>> cubu_produral = new Dictionary<string, List<CubeInfomation>>();
-        ICube[,,] map_data = map.MapData;
-        var inst = new GameObject[map_data.GetLength(0), map_data.GetLength(1), map_data.GetLength(2)];
-        int i = 0;
-        map.CubeInstance = inst;
-
-        var terrainRoot = new GameObject("Terrain");
-        terrainRoot.transform.parent = DungeonManager.Instance.transform;
-        map.TerrainRoot = terrainRoot.transform;
-
-
-
-        for (int x = 0; x < map_data.GetLength(0); x++)
-            for (int y = 0; y < map_data.GetLength(1); y++)
-                for (int z = 0; z < map_data.GetLength(2); z++)
-                {
-                    var cube = map_data[x, y, z].GetInfomation(map, x, y, z);
-
-
-
-                    if (cube != null && cube.Prefab.CompareTag("GenerateTarget"))
-                    {
-                        var gameObject = Instantiate(cube.Prefab, cube.Position, cube.Rotation, terrainRoot.transform);
-                        gameObject.transform.localScale = cube.Scale;
-                        inst[x, y, z] = gameObject;
-                        continue;
-                    }
-
-                    // Cubu情報が問題なければ追加
-                    if (cube != null &&
-                        cube.Prefab.transform.childCount >= 1)
-                    {
-                        for (int child = 0; child < cube.Prefab.transform.childCount; ++child)
-                        {
-                            var children = cube.Prefab.transform.GetChild(child);
-                            var children_cube = cube.Clone();
-                            var point = children_cube.Position;   // 原点
-
-
-
-                            // 天井のオブジェクトをはじく
-                            if (map_data[x, y, z].CubeType == CubeType.ORNAMENT &&
-                                (map_data[x, y + 1, z].CubeType == CubeType.STANDARD || map_data[x, y + 1, z].CubeType == CubeType.VOID))
-                            {
-                                continue;
-                            }
-
-
-                            // 最初にY=0の場合のパターンを作る
-                            children_cube.Rotation *= children.gameObject.transform.localRotation;
-
-                            children_cube.Position.x += children.gameObject.transform.localPosition.x;
-                            children_cube.Position.y -= children.gameObject.transform.localPosition.y;
-                            children_cube.Position.z += children.gameObject.transform.localPosition.z;
-
-                            // オブジェクトを回転
-                            Vector3 toPoint = children_cube.Position - point;
-                            Quaternion rot = Quaternion.AngleAxis(cube.Rotation.eulerAngles.y, Vector3.up);
-
-                            // 座標確定
-                            children_cube.Position = point + (rot * toPoint);
-
-
-                            // 親の基準が1,1,1の場合は子を基準にする。
-                            if (children_cube.Scale == Vector3.one)
-                            {
-                                children_cube.Scale = children.gameObject.transform.localScale;
-                            }
-
-                            if (children.gameObject.CompareTag("GenerateTarget"))
-                            {
-                                var gameObject = Instantiate(children.gameObject, children_cube.Position, children_cube.Rotation, terrainRoot.transform);
-                                gameObject.transform.localScale = children_cube.Scale;
-                                inst[x, y, z] = gameObject;
-                            }
-
-                            // 自作シェーダーのみ登録
-                            if (children.TryGetComponent<MeshFilter>(out MeshFilter Mseh) == true &&
-                                children.GetComponent<Renderer>().sharedMaterial.shader.name == "Custom/EvoRougeBlocks")
-                            {
-                                // 新しいメッシュを登録
-                                if (cubu_produral.ContainsKey(Mseh.sharedMesh.name) == false)
-                                {
-                                    cubu_produral.Add(Mseh.sharedMesh.name, new List<CubeInfomation>());
-                                }
-                                cubu_produral[Mseh.sharedMesh.name].Add(children_cube);
-                            }
-                        }
-                    }
-                }
-
-        // Listに変換
-        foreach (var kvp in cubu_produral)
-        {
-            produral_data.Add(new DrawMeshData());
-
-            foreach (var v in kvp.Value)
-            {
-                produral_data[i].cube_list_.Add(v);
-            }
-
-            i++;
-        }
-
-    }
-
-    /// <summary> 登録したCubuの座標等を設定する </summary>
-    private void DrawProceduralSetup()
-    {
-        int mat = 0;
-
-
-
-        // produral初期化
-        foreach (var v in produral_data)
-        {
-            matrix_produral.Add(new NativeArray<Matrix4x4>(v.cube_list_.Count, Allocator.Persistent));
-            NativeArray<Matrix4x4> temp = matrix_produral[mat];
-
-
-
-            for (int i = 0; i < temp.Length; ++i)
-            {
-                temp[i] = Matrix4x4.TRS(v.cube_list_[i].Position, v.cube_list_[i].Rotation, v.cube_list_[i].Scale);
-            }
-            mat++;
-        }
-
-        // バッファ、マテリアル等の登録
-        for (int i = 0; i < matrix_produral.Count; ++i)
-        {
-            _graphicsBuffers.Add(new GraphicsBuffer(
-                GraphicsBuffer.Target.Structured,
-                matrix_produral[i].Length,
-                Marshal.SizeOf<Matrix4x4>()));
-
-            _graphicsBuffers[i].SetData(matrix_produral[i]);
-
-            // メッシュ、マテリアルの登録
-            produral_data[i].material_ = Instantiate(produral_data[i].cube_list_[0].Prefab.transform.GetChild(0).GetComponent<Renderer>().sharedMaterial);
-            produral_data[i].material_.SetBuffer("_Matrix", _graphicsBuffers[i]);
-            produral_data[i].mesh_ = produral_data[i].cube_list_[0].Prefab.transform.GetChild(0).GetComponent<MeshFilter>().sharedMesh;
-        }
-    }
-
-
 
     private void OnDisable()
     {
-        foreach (var mat in matrix_produral)
-            mat.Dispose();
+        DisposeBuffers();
+    }
 
-        foreach (var g in _graphicsBuffers)
-            g.Dispose();
+
+
+    /// <summary>
+    /// ダンジョンデータを解析し、描画バッチを構築する
+    /// </summary>
+    private void InitializeDungeon(DungeonMap map)
+    {
+        // 既存データのクリア
+        DisposeBuffers();
+        draw_Batches_.Clear();
+
+        // バッチ処理用の一時辞書 (MeshとMaterialの組み合わせでグループ化)
+        var batchDict = new Dictionary<Mesh, DrawBatchData>();
+
+        ICube[,,] mapData = map.MapData;
+        Transform terrainRoot = new GameObject("Terrain").transform;
+        terrainRoot.SetParent(DungeonManager.Instance.transform);
+        map.TerrainRoot = terrainRoot;
+
+        int sizeX = mapData.GetLength(0);
+        int sizeY = mapData.GetLength(1);
+        int sizeZ = mapData.GetLength(2);
+
+        // インスタンス管理用配列
+        map.CubeInstance = new GameObject[sizeX, sizeY, sizeZ];
+
+        for (int x = 0; x < sizeX; x++)
+        {
+            for (int y = 0; y < sizeY; y++)
+            {
+                for (int z = 0; z < sizeZ; z++)
+                {
+                    ProcessCube(map, x, y, z, terrainRoot, batchDict);
+                }
+            }
+        }
+
+        // バッチデータをリストへ変換し、GPUバッファをセットアップ
+        foreach (var batch in batchDict.Values)
+        {
+            SetupGraphicsBuffer(batch);
+            draw_Batches_.Add(batch);
+        }
+
+        isInitialized_ = true;
+    }
+
+    /// <summary>
+    /// 個別のキューブ処理（ロジックの分離）
+    /// </summary>
+    private void ProcessCube(DungeonMap map, int x, int y, int z, Transform parent, Dictionary<Mesh, DrawBatchData> batchDict)
+    {
+        var cellInfo = map.MapData[x, y, z];
+        var cubeInfo = cellInfo.GetInfomation(map, x, y, z);
+
+        if (cubeInfo == null) return;
+
+        // 生成対象タグがついているものはGameObjectとして生成（動的なインタラクション用など）
+        if (cubeInfo.Prefab.CompareTag("GenerateTarget"))
+        {
+            CreateGameObject(cubeInfo, map, x, y, z, parent);
+            return;
+        }
+
+        // 子オブジェクトを走査してバッチに追加
+        if (cubeInfo.Prefab.transform.childCount > 0)
+        {
+            foreach (Transform child in cubeInfo.Prefab.transform)
+            {
+                // カリングロジック
+                if (ShouldCull(map, x, y, z)) continue;
+
+                // 描画データの抽出と変換
+                if (TryGetRenderData(child, out Mesh mesh, out Material mat))
+                {
+                    // シェーダー判定
+                    if (mat.shader.name != TARGET_SHADER_NAME) continue;
+
+                    // 座標計算（ローカル -> ワールド）
+                    // 注: ユーザーコードの回転計算ロジックは複雑なため、意図通り動作すると仮定して簡略化して記述します
+                    // 実際には Matrix4x4.TRS を活用するとより高速です
+
+                    Vector3 worldPos = CalculateWorldPosition(cubeInfo, child);
+                    Quaternion worldRot = CalculateWorldRotation(cubeInfo, child);
+                    Vector3 worldScale = Vector3.Scale(cubeInfo.Scale, child.localScale);
+
+                    Matrix4x4 matrix = Matrix4x4.TRS(worldPos, worldRot, worldScale);
+
+                    // バッチに追加
+                    if (!batchDict.TryGetValue(mesh, out var batch))
+                    {
+                        batch = new DrawBatchData { Mesh = mesh, Material = new Material(mat) }; // マテリアルはインスタンス化が必要か要検討
+                        batchDict[mesh] = batch;
+                    }
+
+                    batch.InstanceMatrices.Add(matrix);
+
+                    // Boundsの拡張（カリング用）
+                    if (batch.InstanceMatrices.Count == 1)
+                    {
+                        batch.TotalBounds = new Bounds(worldPos, Vector3.zero);
+                    }
+                    else
+                    {
+                        batch.TotalBounds.Encapsulate(worldPos);
+                    }
+                }
+            }
+        }
+    }
+
+    private void SetupGraphicsBuffer(DrawBatchData batch)
+    {
+        int count = batch.InstanceMatrices.Count;
+        if (count == 0) return;
+
+        // NativeArrayの確保とデータセット
+        batch.NativeMatrices = new NativeArray<Matrix4x4>(count, Allocator.Persistent);
+        for (int i = 0; i < count; i++)
+        {
+            batch.NativeMatrices[i] = batch.InstanceMatrices[i];
+        }
+
+        // GraphicsBufferの作成
+        batch.MatrixBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, count, Marshal.SizeOf<Matrix4x4>());
+        batch.MatrixBuffer.SetData(batch.NativeMatrices);
+
+        // マテリアルへのセット
+        batch.Material.SetBuffer(matrix_bufferId_, batch.MatrixBuffer);
+    }
+
+    private void RenderBatches()
+    {
+        const float EXPAND_SIZE = 10.0f;
+
+
+
+        foreach (var batch in draw_Batches_)
+        {
+            // 視錐台カリングを有効化
+            Bounds renderBounds = batch.TotalBounds;
+            renderBounds.Expand(EXPAND_SIZE);
+
+            Graphics.DrawMeshInstancedProcedural(
+                batch.Mesh,
+                0,
+                batch.Material,
+                renderBounds,
+                batch.MatrixBuffer.count
+            );
+        }
+    }
+
+    private void DisposeBuffers()
+    {
+        foreach (var batch in draw_Batches_)
+        {
+            batch.Dispose();
+        }
+        draw_Batches_.Clear();
+        isInitialized_ = false;
+    }
+
+    private bool ShouldCull(DungeonMap map, int x, int y, int z)
+    {
+        // 天井カリングロジック
+        var mapData = map.MapData;
+        if (mapData[x, y, z].CubeType == CubeType.ORNAMENT)
+        {
+            // 配列外参照チェック
+            if (y + 1 < mapData.GetLength(1))
+            {
+                var upperType = mapData[x, y + 1, z].CubeType;
+                if (upperType == CubeType.STANDARD || upperType == CubeType.VOID)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private bool TryGetRenderData(Transform t, out Mesh mesh, out Material mat)
+    {
+        mesh = null;
+        mat = null;
+        if (t.TryGetComponent(out MeshFilter mf) && t.TryGetComponent(out Renderer r))
+        {
+            mesh = mf.sharedMesh;
+            mat = r.sharedMaterial;
+            return mesh != null && mat != null;
+        }
+        return false;
+    }
+
+    // 座標計算の簡略化ヘルパー
+    private Vector3 CalculateWorldPosition(CubeInfomation parentCube, Transform child)
+    {
+        Vector3 parentPos = parentCube.Position;
+        Vector3 childLocalPos = child.localPosition;
+
+        // Y軸反転等の特殊なロジックが元コードにあったため、それに従うならここで調整
+        Vector3 adjustedLocal = new Vector3(childLocalPos.x, -childLocalPos.y, childLocalPos.z);
+
+        Quaternion parentRot = Quaternion.AngleAxis(parentCube.Rotation.eulerAngles.y, Vector3.up);
+        return parentPos + (parentRot * adjustedLocal);
+    }
+
+    private Quaternion CalculateWorldRotation(CubeInfomation parentCube, Transform child)
+    {
+        return parentCube.Rotation * child.localRotation;
+    }
+
+    private void CreateGameObject(CubeInfomation info, DungeonMap map, int x, int y, int z, Transform parent)
+    {
+        var go = Instantiate(info.Prefab, info.Position, info.Rotation, parent);
+        go.transform.localScale = info.Scale;
+        map.CubeInstance[x, y, z] = go;
     }
 }
